@@ -16,6 +16,8 @@ When a command starts and when it finishes, a short pop-up shows in front of you
 
 It comes with three Steam buttons (Start SteamVR, Close Game, Close SteamVR). You can add any command of your own: switching displays, locking the PC, shutting it down, changing audio output, running a script. **Local buttons** run on the headset itself, for example **Wake-on-LAN**, to switch the PC on from the Frame.
 
+**→ [Recipes](docs/recipes.md):** step-by-step setups for waking and shutting down the PC, the VR session flow (Start SteamVR, Close Game, Close SteamVR), a streaming screen layout with a status light, and the full PC desktop in the headset with Moonlight + Sunshine.
+
 ## How it works
 
 ```
@@ -177,6 +179,8 @@ sudo setcap CAP_SYS_NICE=eip ~/.local/share/Steam/steamapps/common/SteamVR/bin/l
 Not yet tried: other distros, Flatpak Steam, GNOME, NVIDIA (none of which should matter to Frame Remote itself), a first install on a fresh headset, and the uninstall commands. If you try any of these, please open an issue saying whether it worked.
 
 ## Configuring buttons
+
+Ready-made examples for common setups are in **[Recipes](docs/recipes.md)**.
 
 Everything is in `~/.config/frame-remote/config.toml` on the PC (the template with every option is in `pc/config.example.toml`). After editing, restart the server:
 
