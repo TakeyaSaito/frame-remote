@@ -1,0 +1,204 @@
+#!/usr/bin/env python3
+"""Frame Remote server: runs commands on this PC for the Steam Frame's dashboard panel.
+
+The buttons, status lights, allowed addresses and token all come from
+~/.config/frame-remote/config.toml (see config.example.toml). The Frame only
+knows this PC's address and the token; it gets the button list from here, so
+changing a button never needs anything done on the headset.
+
+    GET  /status          panel layout + state (buttons, indicators, games, jobs)
+    POST /run/<button id> run that button's command (detached via systemd-run)
+
+Every request needs the header  X-Token: <token>  and must come from an address
+in [server].allowed. Only commands written in the config can ever run.
+"""
+import hmac
+import ipaddress
+import json
+import os
+import shlex
+import socket
+import subprocess
+import sys
+import threading
+import time
+import tomllib
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+__version__ = '0.1.0'
+CONFIG = Path(os.environ.get('FRAME_REMOTE_CONFIG',
+                             Path.home() / '.config/frame-remote/config.toml'))
+HERE = Path(__file__).resolve().parent
+PRIVATE = ['10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16']
+
+jobs = {}           # id -> {"state": running|ok|failed, "rc", "detail", "started", "finished"}
+lock = threading.Lock()
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+def expand(arg):
+    return os.path.expanduser(os.path.expandvars(arg))
+
+
+def as_argv(cmd):
+    """A command may be a list (preferred) or a string (split like a shell would)."""
+    argv = shlex.split(cmd) if isinstance(cmd, str) else list(cmd)
+    if not argv:
+        raise ValueError('empty command')
+    argv = [expand(a) for a in argv]
+    if argv[0] == 'frame-remote-steam':     # the bundled helper, wherever it is installed
+        argv[0] = str(HERE / 'frame-remote-steam')
+    return argv
+
+
+def load_config():
+    with CONFIG.open('rb') as f:
+        c = tomllib.load(f)
+    srv = c.get('server', {})
+    token = srv.get('token', '')
+    if len(token) < 16:
+        sys.exit(f'{CONFIG}: [server].token is missing or too short (run install.sh to make one)')
+    cfg = {
+        'name': srv.get('name') or socket.gethostname(),
+        'port': int(srv.get('port', 38112)),
+        'bind': srv.get('bind', '0.0.0.0'),
+        'token': token,
+        'allowed': [ipaddress.ip_network(a, strict=False) for a in srv.get('allowed', PRIVATE)]
+                   + [ipaddress.ip_network('127.0.0.1/32')],
+        'show_games': bool(srv.get('show_games', True)),
+        'timeout': int(srv.get('command_timeout', 180)),
+        'buttons': {}, 'order': [], 'indicators': [],
+    }
+    for b in c.get('button', []):
+        bid = b['id']
+        if not bid.replace('-', '').replace('_', '').isalnum():
+            sys.exit(f'{CONFIG}: button id {bid!r} may only use letters, digits, - and _')
+        cfg['buttons'][bid] = {
+            'id': bid, 'title': b.get('title', bid), 'subtitle': b.get('subtitle', ''),
+            'row': b.get('row', ''), 'confirm': bool(b.get('confirm', False)),
+            'argv': as_argv(b['command']),
+        }
+        cfg['order'].append(bid)
+    for i in c.get('indicator', []):
+        cfg['indicators'].append({'label': i['label'], 'argv': as_argv(i['check'])})
+    if not cfg['buttons']:
+        sys.exit(f'{CONFIG}: no [[button]] entries')
+    return cfg
+
+
+CFG = load_config()
+
+
+def load_helper():
+    """The bundled frame-remote-steam, imported for its process scan."""
+    import importlib.machinery
+    import importlib.util
+    loader = importlib.machinery.SourceFileLoader('frs', str(HERE / 'frame-remote-steam'))
+    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader('frs', loader))
+    loader.exec_module(mod)
+    return mod
+
+
+try:
+    STEAM = load_helper()
+except Exception as e:      # helper missing: no game list, the rest still works
+    log(f'no frame-remote-steam next to the server ({e}); game list disabled')
+    STEAM = None
+
+
+def indicator_states():
+    out = []
+    for ind in CFG['indicators']:
+        try:
+            on = subprocess.run(ind['argv'], capture_output=True, timeout=3).returncode == 0
+        except Exception:
+            on = False
+        out.append({'label': ind['label'], 'on': on})
+    return out
+
+
+def run_job(bid):
+    b = CFG['buttons'][bid]
+    unit = f'frame-remote-{bid}-{int(time.time())}'
+    # systemd-run: the command lives outside this service, so restarting the
+    # server never kills a half-done command. --pipe brings its output back.
+    cmd = ['systemd-run', '--user', '--wait', '--collect', '--quiet', '--pipe',
+           f'--unit={unit}', '--'] + b['argv']
+    log(f'run {bid}: {shlex.join(b["argv"])}')
+    try:
+        p = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                           timeout=CFG['timeout'])
+        rc, out = p.returncode, (p.stdout + p.stderr).strip()
+    except subprocess.TimeoutExpired:
+        rc, out = 124, f'still running after {CFG["timeout"]} s'
+    detail = out.splitlines()[-1][:100] if out else ''
+    with lock:
+        jobs[bid].update(state='ok' if rc == 0 else 'failed', rc=rc, detail=detail,
+                         finished=time.time())
+    log(f'{bid} finished rc={rc}' + (f': {detail}' if detail else ''))
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        pass
+
+    def reply(self, code, obj):
+        body = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def allowed(self):
+        ip = ipaddress.ip_address(self.client_address[0].removeprefix('::ffff:'))
+        if not any(ip in net for net in CFG['allowed']):
+            log(f'refused {ip} {self.path} (not in [server].allowed)')
+            return False
+        if not hmac.compare_digest(self.headers.get('X-Token', ''), CFG['token']):
+            log(f'bad token from {ip} {self.path}')
+            return False
+        return True
+
+    def do_GET(self):
+        if not self.allowed():
+            return self.reply(403, {'error': 'forbidden'})
+        if self.path != '/status':
+            return self.reply(404, {'error': 'not found'})
+        with lock:
+            j = {k: dict(v) for k, v in jobs.items()}
+        steamvr, games = None, None
+        if STEAM:
+            steamvr, ids = STEAM.quick_status()
+            games = sorted(STEAM.app_name(a) for a in ids) if CFG['show_games'] else None
+        self.reply(200, {
+            'version': 2, 'server_version': __version__, 'name': CFG['name'],
+            'buttons': [{k: v for k, v in CFG['buttons'][b].items() if k != 'argv'}
+                        for b in CFG['order']],
+            'indicators': indicator_states(), 'steamvr': steamvr, 'games': games,
+            'jobs': j, 'now': time.time(),
+        })
+
+    def do_POST(self):
+        if not self.allowed():
+            return self.reply(403, {'error': 'forbidden'})
+        bid = self.path.removeprefix('/run/')
+        if not self.path.startswith('/run/') or bid not in CFG['buttons']:
+            return self.reply(404, {'error': 'unknown command'})
+        with lock:
+            if jobs.get(bid, {}).get('state') == 'running':
+                return self.reply(409, {'error': 'already running'})
+            jobs[bid] = {'state': 'running', 'rc': None, 'detail': '',
+                         'started': time.time(), 'finished': None}
+        threading.Thread(target=run_job, args=(bid,), daemon=True).start()
+        self.reply(202, {'started': bid})
+
+
+if __name__ == '__main__':
+    log(f'Frame Remote {__version__}, {CFG["name"]}: listening on {CFG["bind"]}:{CFG["port"]}, '
+        f'{len(CFG["buttons"])} buttons, allowed {", ".join(map(str, CFG["allowed"]))}')
+    ThreadingHTTPServer((CFG['bind'], CFG['port']), Handler).serve_forever()

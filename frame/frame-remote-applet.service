@@ -1,0 +1,11 @@
+[Unit]
+Description=Frame Remote: SteamVR dashboard panel that runs commands on your PC
+
+[Service]
+Environment=EGL_PLATFORM=surfaceless PYOPENGL_PLATFORM=egl
+ExecStart=%h/.local/share/frame-remote/venv/bin/python -u %h/.local/share/frame-remote/frame-remote-applet.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

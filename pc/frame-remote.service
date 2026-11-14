@@ -1,0 +1,11 @@
+[Unit]
+Description=Frame Remote: run PC commands from the Steam Frame's SteamVR dashboard
+After=graphical-session.target
+
+[Service]
+ExecStart=@DEST@/frame-remote-server
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

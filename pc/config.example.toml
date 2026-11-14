@@ -1,0 +1,108 @@
+# Frame Remote: PC side configuration.
+# Lives at ~/.config/frame-remote/config.toml. The server re-reads it when restarted:
+#     systemctl --user restart frame-remote
+# The Frame gets the button list from here, so nothing on the headset changes
+# when you add, remove or rename a button.
+
+[server]
+# Shared secret; the Frame sends it with every request. install.sh fills it in.
+token = "CHANGE-ME"
+
+# Name shown at the top of the panel (default: this PC's hostname).
+# name = "Gaming PC"
+
+port = 38112
+# bind = "0.0.0.0"
+
+# Who may connect (single addresses or networks). Put your Frame's address here
+# once it has a fixed one (a DHCP reservation in your router), e.g.
+#     allowed = ["192.168.1.50"]
+# Default: any private LAN address (the token is still required).
+allowed = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+
+# Show the names of running Steam games on the panel.
+show_games = true
+
+# Give up on a command after this many seconds.
+command_timeout = 180
+
+
+# ---------------------------------------------------------------------------
+# Buttons. Each one runs a command on this PC. Buttons with the same `row`
+# are drawn side by side under that heading (up to 4 per row look good), in the
+# order written here.
+#
+#   id        unique, letters/digits/-/_ (used in the URL)
+#   title     big text on the button
+#   subtitle  small text under it
+#   row       heading of the row it sits in
+#   confirm   true = needs a second tap within 4 s (for anything destructive)
+#   command   list of arguments (no shell), or a string split like a shell
+#             would split it. ~ and $VARS are expanded. Write
+#             "frame-remote-steam" to use the bundled Steam helper.
+#
+# The command's last line of output is shown on the panel, and exit status 0
+# means success. Commands run as your user in your desktop session, so things
+# like kscreen-doctor, notify-send or pactl work. Wrap anything that needs a
+# shell in  ["sh", "-c", "..."].
+# ---------------------------------------------------------------------------
+
+[[button]]
+id = "steamvr-start"
+title = "Start SteamVR"
+subtitle = "Before a Proton VR game"
+row = "VR"
+command = ["frame-remote-steam", "start-vr"]
+
+[[button]]
+id = "close-games"
+title = "Close Game"
+subtitle = "SteamVR keeps running"
+row = "VR"
+confirm = true
+command = ["frame-remote-steam", "close-games"]
+
+[[button]]
+id = "steamvr-close"
+title = "Close SteamVR"
+subtitle = "And any VR game"
+row = "VR"
+confirm = true
+command = ["frame-remote-steam", "close-vr"]
+
+# Example: a row of your own commands.
+#
+# [[button]]
+# id = "monitors-off"
+# title = "Monitors Off"
+# subtitle = "Only the TV stays on"
+# row = "Screen"
+# command = ["kscreen-doctor", "output.DP-1.disable", "output.DP-2.disable"]
+#
+# [[button]]
+# id = "shutdown"
+# title = "Shut Down PC"
+# subtitle = "Powers off in 5 s"
+# row = "Power"
+# confirm = true
+# # the delay lets the panel hear "done" before the PC goes down
+# command = ["sh", "-c", "systemd-run --user --quiet --unit=frame-remote-poweroff sh -c 'sleep 5 && systemctl poweroff' && echo 'Shutting down in 5 seconds.'"]
+#
+# (Waking the PC can't be done from here, since the PC is off: add a Wake-on-LAN
+#  button to the headset's frame.toml instead, see the README.)
+#
+# [[button]]
+# id = "lock"
+# title = "Lock PC"
+# row = "PC"
+# command = ["loginctl", "lock-session"]
+
+
+# ---------------------------------------------------------------------------
+# Status lights at the top of the panel (SteamVR's is built in). `check` is a
+# command; exit status 0 = light on. Keep them fast: they run on every refresh.
+# ---------------------------------------------------------------------------
+
+# [[indicator]]
+# label = "TV on"
+# check = ["sh", "-c", "kscreen-doctor -o | grep -q 'HDMI-A-1.*enabled'"]

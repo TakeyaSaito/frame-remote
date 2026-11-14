@@ -1,0 +1,327 @@
+#!/usr/bin/env python3
+"""Steam / SteamVR helper for Frame Remote (runs on the PC).
+
+    frame-remote-steam start-vr      start SteamVR through Steam, wait until it runs
+    frame-remote-steam close-games   close every running Steam game, leave SteamVR
+    frame-remote-steam close-vr      close SteamVR, plus any game using VR (it would restart it)
+    frame-remote-steam close-all     close every game and SteamVR
+    frame-remote-steam status        print what is running
+
+Why "close" is more than killing a process: a Proton game is a whole Wine
+container (wineserver, explorer.exe, the game) plus the `reaper SteamLaunch
+AppId=<id>` process Steam uses to track it; killing only the window leaves Steam
+thinking the game still runs. A game that is still exiting also starts SteamVR
+again, so games are closed and waited for first, then SteamVR, then anything left
+in SteamVR/bin/ is killed, and the whole thing repeats until nothing comes back.
+
+The last line printed is the summary the Frame shows. Exit 0 = success.
+"""
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+__version__ = '0.1.0'
+STEAMVR_APPID = '250820'
+VR_LIBS = ('openvr_api', 'openxr_loader', 'vrclient')
+STEAMVR_BIN = '/SteamVR/bin/'
+REAPER = re.compile(r'reaper SteamLaunch AppId=(\d+)')
+ROUNDS = 3
+HOME = Path.home()
+STEAM_ROOTS = [HOME / '.local/share/Steam', HOME / '.steam/steam',
+               HOME / '.var/app/com.valvesoftware.Steam/.local/share/Steam']
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+# --- Steam libraries -------------------------------------------------------
+
+def libraries():
+    """Every steamapps folder Steam knows about (from libraryfolders.vdf)."""
+    seen = []
+    for root in STEAM_ROOTS:
+        vdf = root / 'steamapps/libraryfolders.vdf'
+        if not vdf.exists():
+            continue
+        paths = [root] + [Path(p) for p in re.findall(r'"path"\s+"([^"]+)"', vdf.read_text(errors='replace'))]
+        for p in paths:
+            sa = (p / 'steamapps').resolve()
+            if sa.is_dir() and sa not in seen:
+                seen.append(sa)
+    return seen
+
+
+def app_name(appid, _cache={}):
+    if appid not in _cache:
+        name = None
+        for lib in libraries():
+            acf = lib / f'appmanifest_{appid}.acf'
+            if acf.exists():
+                m = re.search(r'"name"\s+"([^"]*)"', acf.read_text(errors='replace'))
+                name = m.group(1) if m else None
+                break
+        _cache[appid] = name or f'App {appid}'   # non-Steam shortcuts have no manifest
+    return _cache[appid]
+
+
+def steamvr_dir():
+    for lib in libraries():
+        d = lib / 'common/SteamVR'
+        if d.is_dir():
+            return d
+    return None
+
+
+# --- processes -------------------------------------------------------------
+
+def procs():
+    for p in Path('/proc').iterdir():
+        if p.name.isdigit():
+            try:
+                yield int(p.name), (p / 'cmdline').read_bytes().replace(b'\0', b' ').decode(errors='replace')
+            except OSError:
+                pass
+
+
+def environ(pid):
+    try:
+        return Path(f'/proc/{pid}/environ').read_bytes().split(b'\0')
+    except OSError:
+        return []
+
+
+def appid_of(pid):
+    for e in environ(pid):
+        if e.startswith(b'SteamAppId='):
+            return e.split(b'=', 1)[1].decode() or None
+    return None
+
+
+def has_vr_lib(pid):
+    try:
+        maps = Path(f'/proc/{pid}/maps').read_text(errors='replace')
+    except OSError:
+        return False
+    return any(lib in line.rsplit('/', 1)[-1].lower() for line in maps.splitlines() for lib in VR_LIBS)
+
+
+def steamvr_running():
+    return any('SteamVR/bin/' in cmd and ('vrserver' in cmd or 'vrmonitor' in cmd) for _, cmd in procs())
+
+
+def steam_running():
+    return any(re.search(r'(steamrt64|ubuntu12_32|ubuntu12_64)/steam( |$)', cmd) for _, cmd in procs())
+
+
+def quick_status():
+    """(SteamVR running, set of game AppIDs) from command lines only: cheap enough
+    for the panel's status poll. running() also reads memory maps, for closing."""
+    ids, vr = set(), False
+    for _, cmd in procs():
+        if 'SteamVR/bin/' in cmd and ('vrserver' in cmd or 'vrmonitor' in cmd):
+            vr = True
+        m = REAPER.search(cmd)
+        if m and m.group(1) != STEAMVR_APPID:
+            ids.add(m.group(1))
+    return vr, ids
+
+
+def running(vr_only=False):
+    """(set of game AppIDs, SteamVR running?) for everything Steam launched."""
+    me = os.getpid()
+    games, vr_games, vr = set(), set(), False
+    for pid, cmd in procs():
+        if pid == me:
+            continue
+        if STEAMVR_BIN in cmd:
+            vr = True
+            continue
+        m = REAPER.search(cmd)
+        is_vr = has_vr_lib(pid)
+        a = m.group(1) if m else (appid_of(pid) if is_vr else None)
+        if not a:
+            continue
+        if a == STEAMVR_APPID:
+            vr = True
+            continue
+        games.add(a)
+        if is_vr:   # the game's own process maps the VR library, not its reaper
+            vr_games.add(a)
+    return (games & vr_games if vr_only else games), vr
+
+
+def game_pids(appid):
+    """Every process of one game: its Proton prefix, its SteamAppId, its reaper."""
+    pids = set()
+    compat = f'compatdata/{appid}/'.encode()
+    exact = f'SteamAppId={appid}'.encode()
+    for pid, cmd in procs():
+        if pid == os.getpid():
+            continue
+        if f'reaper SteamLaunch AppId={appid} ' in cmd + ' ':
+            pids.add(pid)
+            continue
+        env = environ(pid)
+        if exact in env or any(compat in e for e in env):
+            pids.add(pid)
+    return pids
+
+
+def stop_game(appid):
+    """SIGTERM (lets wineserver flush the prefix), then SIGKILL. True when gone."""
+    for sig, wait in ((signal.SIGTERM, 6), (signal.SIGKILL, 10)):
+        pids = game_pids(appid)
+        if not pids:
+            return True
+        for pid in pids:
+            try:
+                os.kill(pid, sig)
+            except (ProcessLookupError, PermissionError):
+                pass
+        deadline = time.time() + wait
+        while time.time() < deadline:
+            if not game_pids(appid):
+                return True
+            time.sleep(0.5)
+    return not game_pids(appid)
+
+
+def kill_steamvr():
+    stop_game(STEAMVR_APPID)
+    time.sleep(2)
+    killed = 0
+    for pid, cmd in procs():
+        if STEAMVR_BIN in cmd:
+            try:
+                os.kill(pid, signal.SIGKILL)
+                killed += 1
+            except ProcessLookupError:
+                pass
+    return killed
+
+
+def names(ids):
+    return ', '.join(sorted(app_name(a) for a in ids))
+
+
+# --- commands --------------------------------------------------------------
+
+def steam_command(*args):
+    """How to run Steam here: native `steam`, else the Flatpak, else xdg-open."""
+    if shutil.which('steam'):
+        return ['steam', *args]
+    if shutil.which('flatpak') and subprocess.run(['flatpak', 'info', 'com.valvesoftware.Steam'],
+                                                  capture_output=True).returncode == 0:
+        return ['flatpak', 'run', 'com.valvesoftware.Steam', *args]
+    return ['xdg-open', *args]
+
+
+def launch_detached(argv):
+    """Start argv in its own systemd user unit. A plain child would be killed with the
+    button's unit when this helper exits, which matters when it ends up being Steam."""
+    unit = f'frame-remote-launch-{int(time.time() * 1000)}'
+    r = subprocess.run(['systemd-run', '--user', '--quiet', '--collect', f'--unit={unit}', '--', *argv],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if r.returncode != 0:   # no systemd user manager: fall back to a new session
+        subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+
+
+def start_vr():
+    if steamvr_running():
+        log('SteamVR is already running.')
+        return 0
+    vr = steamvr_dir()
+    launcher = vr / 'bin/linux64/vrcompositor-launcher' if vr else None
+    if launcher and launcher.exists() and shutil.which('getcap'):   # getcap: libcap tools
+        caps = subprocess.run(['getcap', str(launcher)], capture_output=True, text=True).stdout
+        if 'cap_sys_nice' not in caps:
+            # Without it SteamVR waits forever behind a pkexec prompt that often can't open.
+            log(f"SteamVR would hang: run  sudo setcap CAP_SYS_NICE=eip '{launcher}'")
+            return 1
+    url = f'steam://run/{STEAMVR_APPID}'
+    cold = not steam_running()
+    if cold:
+        # Steam itself is down (it crashes now and then around SteamVR): start it with the
+        # URL, so it launches SteamVR once it has finished starting up.
+        print('Steam is not running: starting Steam first...', flush=True)
+    launch_detached(steam_command(url))
+    deadline = time.time() + (150 if cold else 45)
+    while time.time() < deadline:
+        if steamvr_running():
+            log('Started Steam and SteamVR.' if cold else 'SteamVR is running.')
+            return 0
+        time.sleep(1)
+    if cold and steam_running():
+        log("Steam started, but SteamVR didn't; press Start SteamVR again.")
+    elif cold:
+        log("Steam didn't start (check the PC).")
+    else:
+        log("SteamVR didn't start within 45 s (check Steam for a stuck launch).")
+    return 1
+
+
+def close(mode):
+    """mode: games | vr | all"""
+    vr_only, close_vr = mode == 'vr', mode != 'games'
+    games, vr = running(vr_only)
+    vr = vr and close_vr
+    if not games and not vr:
+        log({'games': 'No game is running.', 'vr': "SteamVR isn't running.",
+             'all': 'Nothing is running.'}[mode])
+        return 0
+    closed, killed = set(), 0
+    for _ in range(ROUNDS):
+        for a in sorted(games):
+            stop_game(a)
+            closed.add(a)
+        deadline = time.time() + 20     # really gone, or they start SteamVR again
+        while time.time() < deadline and running()[0] & games:
+            time.sleep(1)
+        if close_vr:
+            killed += kill_steamvr()
+            time.sleep(3)               # anything that restarts SteamVR shows itself now
+        games, vr = running(vr_only)
+        vr = vr and close_vr
+        if not games and not vr:
+            break
+    left = []
+    if games:
+        left.append(names(games))
+    if vr:
+        left.append('SteamVR')
+    if left:
+        log(f'Still running: {", ".join(left)}')
+        return 1
+    what = names(closed) if closed else ''
+    if close_vr:
+        what = f'{what} and SteamVR' if what else 'SteamVR'
+    log(f'Closed {what}.' + (' (SteamVR left running)' if mode == 'games' else ''))
+    return 0
+
+
+def status():
+    games, _ = running()
+    log(f'Steam: {"running" if steam_running() else "not running"}')
+    log(f'SteamVR: {"running" if steamvr_running() else "not running"}')
+    log(f'Games: {names(games) or "-"}')
+    return 0
+
+
+def main():
+    cmds = {'start-vr': start_vr, 'close-games': lambda: close('games'),
+            'close-vr': lambda: close('vr'), 'close-all': lambda: close('all'), 'status': status}
+    if len(sys.argv) != 2 or sys.argv[1] not in cmds:
+        print(__doc__.strip().split('\n\n')[1], file=sys.stderr)
+        return 2
+    return cmds[sys.argv[1]]()
+
+
+if __name__ == '__main__':
+    sys.exit(main())
