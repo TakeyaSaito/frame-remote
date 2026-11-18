@@ -175,6 +175,7 @@ sudo setcap CAP_SYS_NICE=eip ~/.local/share/Steam/steamapps/common/SteamVR/bin/l
 |---|---|
 | PC | CachyOS (Arch-based), KDE Plasma 6 on Wayland, AMD GPU, native Steam |
 | Headset | Steam Frame, SteamOS 0.5.9 |
+| Features | All buttons, including Wake-on-LAN from the headset (PC fully off) and Shut Down |
 
 Not yet tried: other distros, Flatpak Steam, GNOME, NVIDIA (none of which should matter to Frame Remote itself), a first install on a fresh headset, and the uninstall commands. If you try any of these, please open an issue saying whether it worked.
 
